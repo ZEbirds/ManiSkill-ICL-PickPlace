@@ -41,7 +41,8 @@ def pair_config(args, pair_id):
     from .env import sample_object_set
     rng = np.random.default_rng(args.seed_base + pair_id * 7919)
     n = int(rng.integers(args.num_objects_min, args.num_objects_max + 1))
-    allowed = ["box"] if args.robot == "xarm6_robotiq" else None  # xarm6 圆桶类仍不稳定, 暂只 box
+    # xarm6 实测支持 box/round; tray、bowl 适配中
+    allowed = ["box", "round"] if args.robot == "xarm6_robotiq" else None
     object_set = sample_object_set(rng, n, allowed_receptacles=allowed)
     intended_order = [s["key"] for s in rng.permutation(object_set["objects"])]
     context_seed = int(rng.integers(1, 2**31 - 1))
