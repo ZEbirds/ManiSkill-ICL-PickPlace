@@ -24,6 +24,7 @@ from mani_skill.utils.scene_builder.table import TableSceneBuilder
 from mani_skill.utils.structs.actor import Actor
 from mani_skill.utils.structs.pose import Pose
 
+Q_CYL_VERTICAL = [np.cos(np.pi / 4), 0, np.sin(np.pi / 4), 0]  # 绕y转90度: 轴 x->z
 CAMERA_WIDTH = 480
 CAMERA_HEIGHT = 360
 CAMERA_EYE = (0.25, 0.40, 0.55)
@@ -47,7 +48,8 @@ def hue_name(h):
     return "red"
 
 
-def sample_object_set(rng: np.random.Generator, num_objects: int) -> dict:
+def sample_object_set(rng: np.random.Generator, num_objects: int,
+                      allowed_receptacles=None) -> dict:
     """采样一个 pair 共享的场景配置: 物体池 + 篮子 + 桌面板 + 背景板。"""
     objects = []
     hues = []
@@ -79,12 +81,38 @@ def sample_object_set(rng: np.random.Generator, num_objects: int) -> dict:
         objects.append(spec)
 
     interior = (float(rng.uniform(0.10, 0.12)), float(rng.uniform(0.085, 0.10)))
-    receptacle_type = str(rng.choice(["box", "round"]))
+    # 篮子类型: YCB 碗(真实 mesh)只装 <=3 个物体; 浅托盘墙更矮; 锥形桶上宽下窄
+    choices = ["box", "round", "tray", "tapered"]
+    if num_objects <= 3:
+        choices.append("ycb_bowl")
+    if allowed_receptacles is not None:
+        choices = [c for c in choices if c in allowed_receptacles] or ["box"]
+    receptacle_type = str(rng.choice(choices))
+    if receptacle_type == "tray":
+        interior = (float(rng.uniform(0.11, 0.13)), float(rng.uniform(0.09, 0.105)))
+        wall_height = float(rng.uniform(0.045, 0.055))
+    elif receptacle_type == "tapered":
+        interior = (float(rng.uniform(0.105, 0.125)), float(rng.uniform(0.085, 0.095)))
+        wall_height = float(rng.uniform(0.07, 0.09))
+    elif receptacle_type == "ycb_bowl":
+        interior = (0.065, 0.065)  # 有效内半径
+        wall_height = 0.048
+        for o in objects:  # 碗小, 物体半径压到 <=0.033
+            if o["shape"] == "cube" and o["half"] > 0.033:
+                o["half"], o["radius"], o["top_z"] = 0.033, 0.033, 0.033
+            elif o["shape"] == "box":
+                hx = min(o["half_sizes"][0], 0.032); hy = min(o["half_sizes"][1], 0.026)
+                o["half_sizes"] = [hx, hy, o["half_sizes"][2]]
+                o["radius"], o["top_z"] = float(np.hypot(hx, hy)), o["half_sizes"][2]
+            elif o["shape"] == "cylinder" and o["radius"] > 0.033:
+                o["radius"], o["radius3"] = 0.033, 0.033
+    else:
+        wall_height = float(rng.uniform(0.065, 0.085))
     receptacle = dict(
         type=receptacle_type,
         interior_half=interior,
         wall_thick=float(rng.uniform(0.008, 0.012)),
-        wall_height=float(rng.uniform(0.065, 0.085)),
+        wall_height=wall_height,
         floor_thick=0.01,
         color=[float(rng.uniform(0.3, 0.7)), float(rng.uniform(0.25, 0.6)),
                float(rng.uniform(0.2, 0.5)), 1.0],
@@ -96,10 +124,27 @@ def sample_object_set(rng: np.random.Generator, num_objects: int) -> dict:
         h = (base_hue + rng.uniform(-0.06, 0.06)) % 1.0
         rgb = colorsys.hsv_to_rgb(h, rng.uniform(0.25, 0.55), rng.uniform(0.35, 0.85))
         cells.append([float(rgb[0]), float(rgb[1]), float(rgb[2]), 1.0])
-    tabletop = dict(style="patchwork_3x2", base_hue=float(base_hue), cells=cells)
-    backdrop = [float(rng.uniform(0.4, 0.85)), float(rng.uniform(0.4, 0.85)),
-                float(rng.uniform(0.4, 0.85)), 1.0]
-    return dict(objects=objects, receptacle=receptacle, tabletop=tabletop, backdrop=backdrop)
+    table_style = str(rng.choice(["patchwork", "wood_planks", "round_table",
+                                  "dark_gloss", "white_matte"]))
+    tabletop = dict(style=table_style, base_hue=float(base_hue), cells=cells)
+    scene_theme = str(rng.choice(["plain", "home", "factory", "warehouse"]))
+    return dict(objects=objects, receptacle=receptacle, tabletop=tabletop,
+                backdrop=dict(theme=scene_theme,
+                              color=[float(rng.uniform(0.4, 0.85)),
+                                     float(rng.uniform(0.4, 0.85)),
+                                     float(rng.uniform(0.4, 0.85)), 1.0]))
+
+
+def quat_mul_wxyz(a, b):
+    """四元数乘法 (w,x,y,z)。"""
+    w1, x1, y1, z1 = a
+    w2, x2, y2, z2 = b
+    return [
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    ]
 
 
 def _orientation_quat(shape: str, yaw: float) -> list:
@@ -120,7 +165,12 @@ def _orientation_quat(shape: str, yaw: float) -> list:
 
 def release_slots(num_objects: int, interior_half, receptacle_type: str = "box") -> list:
     """篮内投放槽 (相对篮心), 最多 5 个, 保证互不堆叠。圆桶用环形分布。"""
-    if receptacle_type == "round":
+    if receptacle_type == "ycb_bowl":
+        # 碗小: 对角布局避免叠放 (最多 3)
+        diag = interior_half[0] * 0.45
+        pts = [(diag, diag), (-diag, -diag), (diag, -diag)]
+        return pts[:num_objects]
+    if receptacle_type in ("round", "tapered"):
         r = interior_half[0] * 0.38
         slots = [(0.0, 0.0)]
         for i in range(num_objects - 1):
@@ -190,45 +240,19 @@ class ICLPickPlaceEnv(BaseEnv):
             self.objects[spec["key"]] = actor
 
         self.receptacle_spec = obj_set["receptacle"]
-        if self.receptacle_spec.get("type") == "round":
+        rtype = self.receptacle_spec.get("type", "box")
+        if rtype == "round":
             self.receptacle = self._build_round_receptacle(self.receptacle_spec)
-        else:
+        elif rtype == "tapered":
+            self.receptacle = self._build_tapered_receptacle(self.receptacle_spec)
+        elif rtype == "ycb_bowl":
+            self.receptacle = self._build_ycb_bowl(self.receptacle_spec)
+        else:  # box / tray (同一构建器, 参数不同)
             self.receptacle = self._build_receptacle(self.receptacle_spec)
 
-        # 桌面顶板 (纯视觉): 3x2 拼接色块
-        tp = obj_set["tabletop"]
-        if tp.get("style") == "patchwork_3x2":
-            x0, dx = -0.72, 1.24 / 3
-            y0, dy = -0.55, 1.10 / 2
-            for iy in range(2):
-                for ix in range(3):
-                    b = self.scene.create_actor_builder()
-                    b.add_box_visual(
-                        pose=sapien.Pose(p=[x0 + dx * (ix + 0.5), y0 + dy * (iy + 0.5), -0.0015]),
-                        half_size=[dx / 2 * 0.98, dy / 2 * 0.98, 0.0025],
-                        material=sapien.render.RenderMaterial(base_color=tp["cells"][iy * 3 + ix]),
-                    )
-                    b.build_kinematic(name=f"tabletop_style_{ix}_{iy}")
-        else:
-            builder = self.scene.create_actor_builder()
-            builder.add_box_visual(
-                pose=sapien.Pose(p=[-0.10, 0.0, -0.0015]),
-                half_size=[0.62, 0.55, 0.0025],
-                material=sapien.render.RenderMaterial(base_color=tp),
-            )
-            builder.build_kinematic(name="tabletop_style")
+        self._build_tabletop_style(obj_set["tabletop"])
 
-        # 背景板 (纯视觉, 三面)
-        bd = obj_set["backdrop"]
-        mat = sapien.render.RenderMaterial(base_color=bd)
-        for name, p, hs in [
-            ("backdrop_back", [-0.95, 0.0, 0.45], [0.02, 1.3, 0.75]),
-            ("backdrop_left", [-0.2, 1.25, 0.45], [1.3, 0.02, 0.75]),
-            ("backdrop_right", [-0.2, -1.25, 0.45], [1.3, 0.02, 0.75]),
-        ]:
-            b2 = self.scene.create_actor_builder()
-            b2.add_box_visual(pose=sapien.Pose(p=p), half_size=hs, material=mat)
-            b2.build_kinematic(name=name)
+        self._build_backdrop_theme(obj_set["backdrop"])
 
     def _build_receptacle(self, spec: dict) -> Actor:
         ihx, ihy = spec["interior_half"]
@@ -262,9 +286,9 @@ class ICLPickPlaceEnv(BaseEnv):
         mat_floor = sapien.render.RenderMaterial(
             base_color=[min(1, c * 1.15) for c in spec["color"][:3]] + [1.0])
         # 圆形底 (薄圆柱)
-        builder.add_cylinder_collision(pose=sapien.Pose(p=[0, 0, ft / 2]),
+        builder.add_cylinder_collision(pose=sapien.Pose(p=[0, 0, ft / 2], q=Q_CYL_VERTICAL),
                                        radius=r + t, half_length=ft / 2)
-        builder.add_cylinder_visual(pose=sapien.Pose(p=[0, 0, ft / 2]),
+        builder.add_cylinder_visual(pose=sapien.Pose(p=[0, 0, ft / 2], q=Q_CYL_VERTICAL),
                                     radius=r + t, half_length=ft / 2, material=mat_floor)
         # 10 段壁
         n_seg, rc = 10, r + t / 2
@@ -279,6 +303,165 @@ class ICLPickPlaceEnv(BaseEnv):
             builder.add_box_visual(pose=sapien.Pose(p=center, q=q),
                                    half_size=[chord / 2, t / 2, h / 2], material=mat_wall)
         return builder.build_kinematic(name="receptacle")
+
+    def _build_tapered_receptacle(self, spec: dict) -> Actor:
+        """锥形桶: 12 段壁板向外倾斜, 上口大下口小。"""
+        r_top = spec["interior_half"][0]
+        r_bot = r_top * 0.62
+        t = spec["wall_thick"]
+        h = spec["wall_height"]
+        ft = spec["floor_thick"]
+        builder = self.scene.create_actor_builder()
+        mat = sapien.render.RenderMaterial(base_color=spec["color"])
+        builder.add_cylinder_collision(pose=sapien.Pose(p=[0, 0, ft / 2], q=Q_CYL_VERTICAL),
+                                       radius=r_bot, half_length=ft / 2)
+        builder.add_cylinder_visual(pose=sapien.Pose(p=[0, 0, ft / 2], q=Q_CYL_VERTICAL),
+                                    radius=r_bot, half_length=ft / 2, material=mat)
+        n_seg = 12
+        for i in range(n_seg):
+            ang = 2 * np.pi * i / n_seg
+            rm = (r_top + r_bot) / 2
+            slant_len = np.hypot(r_top - r_bot, h)
+            tilt = np.arctan2(r_top - r_bot, h)
+            center = [rm * np.cos(ang), rm * np.sin(ang), ft + h / 2]
+            yaw = ang + np.pi / 2
+            # 组合旋转: 先绕 y 倾斜 tilt, 再绕 z 转 yaw (wxyz 四元数乘法)
+            qz = [np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)]
+            qy = [np.cos(tilt / 2), 0, np.sin(tilt / 2), 0]
+            q = quat_mul_wxyz(qz, qy)
+            builder.add_box_collision(pose=sapien.Pose(p=center, q=q),
+                                      half_size=[slant_len / 2 * 1.08, t / 2, 0.004])
+            builder.add_box_visual(pose=sapien.Pose(p=center, q=q),
+                                   half_size=[slant_len / 2 * 1.08, t / 2, 0.004], material=mat)
+        return builder.build_kinematic(name="receptacle")
+
+    def _build_ycb_bowl(self, spec: dict) -> Actor:
+        """真实 YCB 碗 mesh (024_bowl): 已下载资产, kinematic 固定。"""
+        from pathlib import Path
+        base = Path.home() / ".maniskill/data/assets/mani_skill2_ycb/models/024_bowl"
+        builder = self.scene.create_actor_builder()
+        builder.add_visual_from_file(str(base / "textured.obj"))
+        builder.add_convex_collision_from_file(str(base / "collision.ply"))
+        return builder.build_kinematic(name="receptacle")
+
+    def _build_tabletop_style(self, tp: dict):
+        """桌面视觉风格 (纯视觉, 物理碰撞沿用原桌)。"""
+        style = tp.get("style", "patchwork")
+        hue = tp.get("base_hue", 0.08)
+
+        def mat(rgb, rough=0.7, metal=0.0):
+            try:
+                return sapien.render.RenderMaterial(
+                    base_color=[*rgb, 1.0], roughness=rough, metallic=metal)
+            except TypeError:
+                return sapien.render.RenderMaterial(base_color=[*rgb, 1.0])
+
+        def add_box(name, p, hs, material, collision=False):
+            b = self.scene.create_actor_builder()
+            if collision:
+                b.add_box_collision(pose=sapien.Pose(p=p), half_size=hs)
+            b.add_box_visual(pose=sapien.Pose(p=p), half_size=hs, material=material)
+            b.build_kinematic(name=name)
+
+        import colorsys as _cs
+        if style == "patchwork":
+            x0, dx = -0.72, 1.24 / 3
+            y0, dy = -0.55, 1.10 / 2
+            for iy in range(2):
+                for ix in range(3):
+                    c = tp["cells"][iy * 3 + ix][:3]
+                    add_box(f"tp_{ix}_{iy}", [x0 + dx * (ix + .5), y0 + dy * (iy + .5), -0.0015],
+                            [dx / 2 * 0.98, dy / 2 * 0.98, 0.0025], mat(c))
+        elif style == "wood_planks":
+            n = 9
+            y0, dy = -0.55, 1.10 / n
+            for iy in range(n):
+                h = (hue + np.random.default_rng(iy).uniform(-0.02, 0.02)) % 1.0
+                v = 0.45 + 0.4 * (iy % 2)
+                rgb = _cs.hsv_to_rgb(h, 0.35, v)
+                add_box(f"tp_plank{iy}", [-0.10, y0 + dy * (iy + .5), -0.0015],
+                        [0.62, dy / 2 * 0.965, 0.0025], mat(rgb, rough=0.55))
+        elif style == "round_table":
+            b = self.scene.create_actor_builder()
+            b.add_cylinder_visual(pose=sapien.Pose(p=[-0.05, -0.05, -0.0015], q=Q_CYL_VERTICAL),
+                                  radius=0.45, half_length=0.0025,
+                                  material=mat(_cs.hsv_to_rgb(hue, 0.4, 0.6)))
+            b.build_kinematic(name="tp_round")
+            b2 = self.scene.create_actor_builder()
+            b2.add_cylinder_visual(pose=sapien.Pose(p=[-0.05, -0.05, -0.47], q=Q_CYL_VERTICAL),
+                                   radius=0.05, half_length=0.47, material=mat([0.25, 0.22, 0.2]))
+            b2.add_cylinder_visual(pose=sapien.Pose(p=[-0.05, -0.05, -0.90], q=Q_CYL_VERTICAL),
+                                   radius=0.22, half_length=0.02, material=mat([0.22, 0.2, 0.18]))
+            b2.build_kinematic(name="tp_round_leg")
+        elif style == "dark_gloss":
+            add_box("tp_gloss", [-0.10, 0.0, -0.0015], [0.62, 0.55, 0.0025],
+                    mat([0.12, 0.12, 0.14], rough=0.15, metal=0.6))
+        else:  # white_matte
+            add_box("tp_matte", [-0.10, 0.0, -0.0015], [0.62, 0.55, 0.0025],
+                    mat([0.88, 0.88, 0.9], rough=0.9))
+
+    def _build_backdrop_theme(self, bd: dict):
+        """背景场景 (纯视觉): plain 三面板 / home 家庭 / factory 工厂 / warehouse 仓库。"""
+        theme = bd.get("theme", "plain")
+
+        def mat(rgb, rough=0.8, metal=0.0):
+            try:
+                return sapien.render.RenderMaterial(
+                    base_color=[*rgb, 1.0], roughness=rough, metallic=metal)
+            except TypeError:
+                return sapien.render.RenderMaterial(base_color=[*rgb, 1.0])
+
+        def add_box(name, p, hs, material):
+            b = self.scene.create_actor_builder()
+            b.add_box_visual(pose=sapien.Pose(p=p), half_size=hs, material=material)
+            b.build_kinematic(name=name)
+
+        if theme == "plain":
+            c = bd.get("color", [0.6, 0.6, 0.6, 1.0])[:3]
+            for name, p, hs in [
+                ("bd_back", [-0.95, 0.0, 0.45], [0.02, 1.3, 0.75]),
+                ("bd_left", [-0.2, 1.25, 0.45], [1.3, 0.02, 0.75]),
+                ("bd_right", [-0.2, -1.25, 0.45], [1.3, 0.02, 0.75]),
+            ]:
+                add_box(name, p, hs, mat(c))
+        elif theme == "home":
+            wall = mat([0.82, 0.78, 0.72])
+            add_box("bd_wall", [-1.0, 0.3, 0.45], [0.02, 1.6, 1.4], wall)
+            add_box("bd_wall2", [-0.2, 1.35, 0.45], [1.4, 0.02, 1.4], mat([0.76, 0.72, 0.66]))
+            # 家具剪影: 柜子 + 两层书架 + 沙发扶手
+            add_box("bd_cabinet", [-0.85, 0.9, -0.15], [0.18, 0.5, 0.78], mat([0.55, 0.38, 0.25]))
+            add_box("bd_shelf_l", [-0.5, 1.18, -0.1], [0.55, 0.12, 0.05], mat([0.6, 0.45, 0.3]))
+            add_box("bd_shelf_l2", [-0.5, 1.18, 0.18], [0.55, 0.12, 0.05], mat([0.6, 0.45, 0.3]))
+            add_box("bd_shelf_v", [-0.5, 1.18, -0.55], [0.55, 0.12, 0.4], mat([0.6, 0.45, 0.3]))
+            add_box("bd_shelf_top", [-0.5, 1.18, 0.42], [0.57, 0.14, 0.04], mat([0.62, 0.47, 0.32]))
+            add_box("bd_sofa", [-0.1, -1.32, -0.35], [0.7, 0.25, 0.6], mat([0.45, 0.5, 0.62]))
+            add_box("bd_sofa_back", [-0.1, -1.52, -0.05], [0.7, 0.12, 0.3], mat([0.42, 0.47, 0.6]))
+        elif theme == "factory":
+            add_box("bd_wall", [-1.0, 0.0, 0.45], [0.02, 1.7, 1.4], mat([0.55, 0.56, 0.58], rough=0.4, metal=0.5))
+            for i, z in enumerate([-0.2, 0.25, 0.7]):
+                add_box(f"bd_stripe{i}", [-0.98, 0.0, z], [0.012, 1.68, 0.10],
+                        mat([0.42, 0.43, 0.46], rough=0.35, metal=0.6))
+            # 货架 + 货箱
+            for side, y in [("a", 1.15), ("b", -1.15)]:
+                add_box(f"bd_post_l{side}", [-0.55, y, -0.1], [0.04, 0.04, 0.85], mat([0.3, 0.48, 0.25], metal=0.4))
+                add_box(f"bd_post_r{side}", [0.25, y, -0.1], [0.04, 0.04, 0.85], mat([0.3, 0.48, 0.25], metal=0.4))
+                for j, z in enumerate([-0.35, 0.0, 0.35]):
+                    add_box(f"bd_beam{side}{j}", [-0.15, y, z], [0.42, 0.05, 0.035],
+                            mat([0.85, 0.55, 0.1], metal=0.3))
+                add_box(f"bd_crate{side}", [-0.25, y, 0.08], [0.13, 0.13, 0.07], mat([0.6, 0.35, 0.2]))
+                add_box(f"bd_crate2{side}", [0.1, y, 0.08], [0.10, 0.11, 0.06], mat([0.5, 0.3, 0.18]))
+            add_box("bd_hazard", [-0.98, 0.0, -0.62], [0.012, 0.8, 0.06], mat([0.9, 0.75, 0.05]))
+        else:  # warehouse
+            add_box("bd_wall", [-1.0, 0.0, 0.6], [0.02, 1.7, 1.6], mat([0.6, 0.6, 0.62]))
+            add_box("bd_wall2", [-0.2, 1.4, 0.6], [1.5, 0.02, 1.6], mat([0.55, 0.55, 0.58]))
+            for side, y, x0 in [("a", 1.12, -0.5), ("b", -1.12, 0.1)]:
+                for k in range(3):
+                    add_box(f"bd_rpost{k}{side}", [x0 + k * 0.4, y, -0.05], [0.035, 0.035, 0.9], mat([0.35, 0.42, 0.55], metal=0.5))
+                for j, z in enumerate([-0.4, -0.05, 0.3]):
+                    add_box(f"bd_rbeam{j}{side}", [x0 + 0.4, y, z], [0.62, 0.05, 0.035], mat([0.4, 0.5, 0.68], metal=0.4))
+                add_box(f"bd_box1{side}", [x0, y, 0.07], [0.12, 0.12, 0.08], mat([0.72, 0.55, 0.35]))
+                add_box(f"bd_box2{side}", [x0 + 0.42, y, 0.07], [0.10, 0.10, 0.07], mat([0.65, 0.48, 0.3]))
+                add_box(f"bd_box3{side}", [x0 + 0.8, y, 0.06], [0.09, 0.11, 0.06], mat([0.7, 0.52, 0.33]))
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
         import os
@@ -369,9 +552,9 @@ class ICLPickPlaceEnv(BaseEnv):
         ft = self.receptacle_spec["floor_thick"]
         h = self.receptacle_spec["wall_height"]
         margin = 0.004
-        if self.receptacle_spec.get("type") == "round":
+        if self.receptacle_spec.get("type") in ("round", "tapered", "ycb_bowl"):
             xy_ok = np.hypot(p[0] - c[0], p[1] - c[1]) <= ihx - margin
-        else:
+        else:  # box / tray
             xy_ok = abs(p[0] - c[0]) <= ihx - margin and abs(p[1] - c[1]) <= ihy - margin
         z_ok = ft - 0.005 <= p[2] <= h + 0.012
         return bool(xy_ok and z_ok)

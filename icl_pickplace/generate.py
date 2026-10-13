@@ -41,7 +41,8 @@ def pair_config(args, pair_id):
     from .env import sample_object_set
     rng = np.random.default_rng(args.seed_base + pair_id * 7919)
     n = int(rng.integers(args.num_objects_min, args.num_objects_max + 1))
-    object_set = sample_object_set(rng, n)
+    allowed = ["box"] if args.robot == "xarm6_robotiq" else None  # xarm6 圆桶类仍不稳定, 暂只 box
+    object_set = sample_object_set(rng, n, allowed_receptacles=allowed)
     intended_order = [s["key"] for s in rng.permutation(object_set["objects"])]
     context_seed = int(rng.integers(1, 2**31 - 1))
     query_seed = int(rng.integers(1, 2**31 - 1))
@@ -115,9 +116,12 @@ def merge_shards(out_dir: Path, args, shard_dirs, shard_eps) -> None:
     """官方 aggregate 合并 + 重建 meta/icl 辅助元数据 (episode_index 偏移重编号)。"""
     from lerobot.datasets.aggregate import aggregate_datasets
 
-    repo_ids = [f"{args.repo_id}_shard{i}" for i in range(len(shard_dirs))]
+    # 跳过空分片 (0 有效 pair 的 worker 不会产生合法数据集)
+    pairs_meta = [(i, d) for i, d in enumerate(shard_dirs) if shard_eps[d] > 0]
+    repo_ids = [f"{args.repo_id}_shard{i}" for i, _ in pairs_meta]
+    roots = [d for _, d in pairs_meta]
     aggregate_datasets(repo_ids=repo_ids, aggr_repo_id=args.repo_id,
-                       roots=shard_dirs, aggr_root=out_dir)
+                       roots=roots, aggr_root=out_dir)
     # 重建 meta/icl
     icl_out = out_dir / "meta" / "icl"
     (icl_out / "episodes").mkdir(parents=True, exist_ok=True)

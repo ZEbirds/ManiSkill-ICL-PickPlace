@@ -54,14 +54,17 @@ def main():
         feats["observation.images.agentview"]["dtype"] == "video" and len(img_shape) == 3,
         str(img_shape),
     )
+    action_shape = tuple(feats["action"]["shape"])
+    state_shape = tuple(feats["observation.state"]["shape"])
     checks.add(
         "action 特征",
-        feats["action"]["dtype"] == "float32" and tuple(feats["action"]["shape"]) == (8,),
+        feats["action"]["dtype"] == "float32" and len(action_shape) == 1,
+        f"shape={action_shape}",
     )
     checks.add(
         "observation.state 特征",
-        feats["observation.state"]["dtype"] == "float32"
-        and tuple(feats["observation.state"]["shape"]) == (25,),
+        feats["observation.state"]["dtype"] == "float32" and len(state_shape) == 1,
+        f"shape={state_shape}",
     )
 
     # 2. 每集: 长度/时间戳/视频帧解码/action+state
@@ -86,7 +89,7 @@ def main():
             img = s["observation.images.agentview"]
             if tuple(img.shape) != img_shape or img.numel() == 0 or float(img.mean()) < 1e-6:
                 all_ok_video = False
-            if tuple(s["action"].shape) != (8,) or tuple(s["observation.state"].shape) != (25,):
+            if tuple(s["action"].shape) != action_shape or tuple(s["observation.state"].shape) != state_shape:
                 all_ok_data = False
     checks.add("所有 episode 时间戳 1/fps 递增", all_ok_ts)
     checks.add("视频帧可解码且分辨率正确", all_ok_video)
